@@ -62,7 +62,12 @@ class PULSEPipeline:
         self._processed_segments: list[dict] = []
         self._session_start = time.time()
 
-        logger.info(f"PULSEPipeline initialized for session {session_id}")
+        # Debug logger — set DEBUG_MODE=1 in .env to enable
+        from backend.debug_logger import DebugLogger
+        debug_enabled = os.getenv("DEBUG_MODE", "1") == "1"  # ON by default for now
+        self._debug = DebugLogger(session_id, enabled=debug_enabled)
+
+        logger.info(f"PULSEPipeline initialized for session {session_id} (debug={'ON' if debug_enabled else 'OFF'})")
 
     # ── Config ─────────────────────────────────────────────────────────────
 
@@ -163,8 +168,14 @@ class PULSEPipeline:
         self._ensure_sensors()
         self._ensure_agents()
 
+        seg_id = segment["segment_id"]
+
+        # ── DEBUG: Log raw sensor data ─────────────────────────────────────
+        self._debug.log_raw_segment(segment)
+        self._debug.log_frames(seg_id, segment.get("frames", []))
+
         result: dict = {
-            "segment_id":  segment["segment_id"],
+            "segment_id":  seg_id,
             "session_id":  self.session_id,
             "gps":         segment["gps"],
             "length_km":   segment["length_km"],
@@ -175,18 +186,22 @@ class PULSEPipeline:
         # ── Channel 1: IRI ─────────────────────────────────────────────────
         iri_result = self._run_iri(segment)
         result["iri"] = iri_result
+        self._debug.log_stage(seg_id, "iri_result", iri_result)
 
         # ── Channel 2: Depth + 3D ─────────────────────────────────────────
         depth_result = self._run_depth(segment)
         result["depth_3d"] = depth_result
+        self._debug.log_stage(seg_id, "depth_result", depth_result)
 
         # ── Channel 4: Acoustic ────────────────────────────────────────────
         acoustic_result = self._run_acoustic(segment)
         result["acoustic"] = acoustic_result
+        self._debug.log_stage(seg_id, "acoustic_result", acoustic_result)
 
         # ── Agent 2: Visual Assessment ────────────────────────────────────
         visual_result = self._run_visual(segment)
         result["visual"] = visual_result
+        # VLM debug logs are handled inside visual_assessor.py itself
 
         # ── Agent 0: Sensor Fusion ────────────────────────────────────────
         segment_for_fusion = {
@@ -198,6 +213,7 @@ class PULSEPipeline:
         }
         fused = self._sensor_fusion.fuse(segment_for_fusion)
         result.update(fused)
+        self._debug.log_stage(seg_id, "fusion_result", fused)
 
         # ── Agent 4: Deterioration Oracle ────────────────────────────────
         if fused.get("iri_value") is not None:
@@ -249,6 +265,9 @@ class PULSEPipeline:
         # ── Timing ────────────────────────────────────────────────────────
         elapsed = time.monotonic() - t_start
         result["processing_time_s"] = round(elapsed, 2)
+
+        # ── DEBUG: Save full final result ─────────────────────────────────
+        self._debug.log_final_result(seg_id, result)
 
         self._processed_segments.append(result)
         logger.info(
@@ -375,6 +394,7 @@ class PULSEPipeline:
     def _run_visual(self, segment: dict) -> dict:
         """Run visual assessment on segment frames."""
         frames = segment.get("frames", [])
+        seg_id = segment.get("segment_id", "unknown")
         if not frames:
             return {"overall_condition": "Unknown", "confidence": "Low",
                     "error": "no_frames", "distresses": []}
@@ -383,6 +403,7 @@ class PULSEPipeline:
             self._ensure_visual_assessor()
             from PIL import Image
             import cv2 as cv
+            from backend.agents.visual_assessor import SYSTEM_PROMPT, ASSESSMENT_PROMPT
 
             # Convert frames to PIL (VLM input format)
             pil_frames = []
@@ -394,10 +415,19 @@ class PULSEPipeline:
             if not pil_frames:
                 return {"overall_condition": "Unknown", "confidence": "Low", "distresses": []}
 
-            return self._visual_assessor.assess_segment(
+            # DEBUG: Log what we're about to send to VLM
+            self._debug.log_vlm_input(seg_id, pil_frames, ASSESSMENT_PROMPT, SYSTEM_PROMPT)
+
+            result = self._visual_assessor.assess_segment(
                 frames=pil_frames,
-                segment_id=segment["segment_id"],
+                segment_id=seg_id,
             )
+
+            # DEBUG: Log VLM raw response and parsed output
+            raw = result.get("raw_response", result.get("error", ""))
+            self._debug.log_vlm_output(seg_id, str(raw), result, result.get("inference_time_s", 0))
+
+            return result
 
         except Exception as exc:
             logger.error(f"Visual assessment failed: {exc}")

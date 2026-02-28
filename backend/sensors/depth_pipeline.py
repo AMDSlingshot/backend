@@ -51,6 +51,10 @@ SCALE_WEIGHTS = {
 SCALE_VALID_MIN = 0.1
 SCALE_VALID_MAX = 100.0
 
+# Sanity clamp: real road ruts never exceed ~80mm even on worst rural roads
+# Values above this indicate uncalibrated depth or non-road surfaces
+MAX_RUT_DEPTH_MM = 100.0
+
 
 class MetricDepthPipeline:
     """
@@ -383,6 +387,14 @@ class MetricDepthPipeline:
 
         rut_depth_m = float(np.median(rut_depths))
         rut_depth_mm = rut_depth_m * 1000.0
+
+        # Sanity clamp: values above MAX_RUT_DEPTH_MM indicate bad scale or non-road
+        if rut_depth_mm > MAX_RUT_DEPTH_MM:
+            logger.warning(
+                f"Rut depth {rut_depth_mm:.1f}mm exceeds {MAX_RUT_DEPTH_MM}mm — "
+                f"clamping (likely uncalibrated depth or non-road surface)"
+            )
+            rut_depth_mm = MAX_RUT_DEPTH_MM
 
         # IRC:SP:20 severity thresholds
         if rut_depth_mm < 10:

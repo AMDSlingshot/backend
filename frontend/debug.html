@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>PULSE Debug Viewer</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #58a6ff;
+        }
+
+        h2 {
+            color: #64ffda;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 8px;
+        }
+
+        h3 {
+            color: #f0883e;
+        }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 12px 0;
+        }
+
+        pre {
+            background: #0d1117;
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 13px;
+            border: 1px solid #30363d;
+        }
+
+        img {
+            max-width: 300px;
+            border-radius: 6px;
+            margin: 4px;
+            border: 1px solid #30363d;
+        }
+
+        .img-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        a {
+            color: #58a6ff;
+            cursor: pointer;
+        }
+
+        .session-btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #58a6ff;
+            padding: 10px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 4px;
+            font-size: 14px;
+        }
+
+        .session-btn:hover {
+            background: #30363d;
+        }
+
+        #content {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>PULSE Debug Viewer</h1>
+    <p>Inspect every piece of data flowing through the pipeline.</p>
+    <div id="sessions"></div>
+    <div id="content"></div>
+    <script>
+        async function loadSessions() {
+            const r = await fetch('/debug/sessions');
+            const d = await r.json();
+            const el = document.getElementById('sessions');
+            if (!d.sessions.length) { el.innerHTML = '<p>No debug sessions yet. Run a collection first.</p>'; return; }
+            el.innerHTML = '<h2>Sessions</h2>' + d.sessions.map(s =>
+                '<div class="card"><b>' + s.session_id + '</b> — ' + s.segments.length + ' segment(s)<br>' +
+                s.segments.map(seg => '<button class="session-btn" onclick="loadSegment(\'' + s.session_id + '\',\'' + seg + '\')">' + seg + '</button>').join('') +
+                '</div>'
+            ).join('');
+        }
+
+        async function loadSegment(sid, segid) {
+            const r = await fetch('/debug/' + sid + '/' + segid);
+            const d = await r.json();
+            const el = document.getElementById('content');
+            let html = '<h2>Session: ' + sid + ' / Segment: ' + segid + '</h2>';
+
+            for (const [fname, data] of Object.entries(d.files)) {
+                html += '<div class="card"><h3>' + fname + '</h3>';
+
+                if (typeof data === 'string') {
+                    html += '<pre>' + escapeHtml(data) + '</pre>';
+                } else if (data.type === 'image_directory') {
+                    html += '<p>' + data.count + ' images</p><div class="img-grid">';
+                    data.files.forEach(img => {
+                        html += '<img src="' + data.base_url + '/' + img + '" title="' + img + '" loading="lazy">';
+                    });
+                    html += '</div>';
+                } else {
+                    html += '<pre>' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>';
+                }
+                html += '</div>';
+            }
+            el.innerHTML = html;
+            el.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function escapeHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+        loadSessions();
+    </script>
+</body>
+
+</html>

@@ -173,7 +173,8 @@ def main():
     logger.info("""
 Next steps:
   1. Copy environment template:
-       copy .env.example backend\\.env
+       copy .env.example .env
+     Then edit .env to add your GEMINI_API_KEY.
 
   2. Run camera calibration (once):
        python calibration/camera_calibration.py
@@ -181,11 +182,10 @@ Next steps:
   3. (Optional) Train acoustic classifier:
        python backend/sensors/train_acoustic.py --data_dir data/audio
 
-  4. Start backend:
-       cd backend
-       uvicorn main:app --host 0.0.0.0 --port 8000
+  4. Start backend over HTTPS:
+       python run_https.py
 
-  5. Connect phone to same Wi-Fi → open http://<YOUR_LAPTOP_IP>:8000
+  5. Connect phone to same Wi-Fi → open https://<YOUR_LAPTOP_IP>:8000/app/index.html
 """)
     sys.exit(0 if all(results.values()) else 1)
 

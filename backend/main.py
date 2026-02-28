@@ -1,65 +1,62 @@
 """
 backend/main.py
 
-PULSE Backend — FastAPI Application
-
-Entrypoint for the PULSE backend server.
-
-Endpoints:
-    WebSocket  /ws/{session_id}     — Real-time sensor data ingestion
-    GET        /health              — Health check
-    GET        /report/{session_id} — Generate session PDF report
-    GET        /session/{session_id}/summary — Session aggregate stats
-
-Run:
-    cd backend
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+FastAPI entrypoint for PULSE.
+Provides:
+- WebSocket endpoint for real-time smartphone data ingestion
+- REST endpoints for session summaries and report generation
+- Debug endpoints for inspecting pipeline data
 """
 
+import asyncio
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+import sys
 from pathlib import Path
+from typing import Dict
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+# Load .env from project root BEFORE anything reads os.getenv()
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        _env_example = Path(__file__).parent.parent / ".env.example"
+        if _env_example.exists():
+            load_dotenv(_env_example)
+except ImportError:
+    pass  # Will use system environment variables
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
-# Load environment variables
-load_dotenv(Path(__file__).parent / ".env")
+from .pipeline import PULSEPipeline
+from .segment_manager import SegmentManager
+
+# Suppress Windows ProactorEventLoop connection reset noise
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Active pipeline sessions: session_id → PULSEPipeline
-_active_pipelines: dict = {}
-_active_managers: dict = {}
+# ── Paths ────────────────────────────────────────────────────────────────────
 
+PROJECT_ROOT = Path(__file__).parent.parent
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
+DEBUG_DIR = PROJECT_ROOT / "output" / "debug"
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application startup and shutdown."""
-    logger.info("PULSE Backend starting up...")
-    # Create output directory
-    Path("output/reports").mkdir(parents=True, exist_ok=True)
-    yield
-    logger.info("PULSE Backend shutting down. Active sessions: "
-                + str(list(_active_pipelines.keys())))
+# ── App ──────────────────────────────────────────────────────────────────────
 
+app = FastAPI(title="PULSE Backend API")
 
-app = FastAPI(
-    title="PULSE — Physical Understanding of Living Street Economics",
-    description="Road condition assessment backend: 5-channel sensors + 6 AI agents.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# CORS — allow PWA collector from any origin (adjust for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,193 +65,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Static file mounts
+if FRONTEND_DIR.exists():
+    app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
-# ── Health Check ───────────────────────────────────────────────────────────
+if DEBUG_DIR.exists():
+    app.mount("/debug-files", StaticFiles(directory=str(DEBUG_DIR)), name="debug-files")
 
-@app.get("/health", tags=["System"])
-async def health_check():
-    """Basic health check endpoint."""
-    import torch
-    cuda_available = False
-    cuda_device = None
-    try:
-        cuda_available = torch.cuda.is_available()
-        if cuda_available:
-            cuda_device = torch.cuda.get_device_name(0)
-    except Exception:
-        pass
-
-    return {
-        "status":         "ok",
-        "version":        "1.0.0",
-        "cuda_available": cuda_available,
-        "cuda_device":    cuda_device,
-        "active_sessions": list(_active_pipelines.keys()),
-    }
+# Active session states
+active_sessions: Dict[str, dict] = {}
 
 
-# ── WebSocket — Real-Time Data Ingestion ───────────────────────────────────
+# ── Core Endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "version": "1.0.0"}
+
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """
-    WebSocket endpoint for smartphone sensor data.
-
-    The PWA collector connects here and streams:
-        IMU packets  @ 200Hz
-        GPS packets  @ 1Hz
-        FRAME packets @ 2fps (640×360 base64 JPEG)
-        AUDIO packets @ 10Hz (RMS + optional raw samples)
-
-    Every complete 100m segment is processed through the full agent pipeline
-    and the result is streamed back as SEGMENT_COMPLETE.
-    """
+    """Main ingestion endpoint for smartphone data."""
     await websocket.accept()
-    logger.info(f"WebSocket session opened: {session_id}")
+    logger.info(f"Client connected for session: {session_id}")
 
-    # Initialise pipeline and segment manager for this session
-    from backend.pipeline import PULSEPipeline
-    from backend.segment_manager import SegmentManager
+    manager = SegmentManager(segment_length_m=100.0)
+    pipeline = PULSEPipeline(session_id=session_id)
 
-    pipeline = PULSEPipeline(session_id)
-    manager  = SegmentManager(session_id)
-
-    _active_pipelines[session_id] = pipeline
-    _active_managers[session_id]  = manager
-
-    # Acknowledge session start
-    await websocket.send_json({
-        "type":       "SESSION_STARTED",
-        "session_id": session_id,
-        "message":    "PULSE backend ready. Stream sensor data.",
-    })
+    active_sessions[session_id] = {
+        "manager": manager,
+        "pipeline": pipeline,
+    }
 
     try:
         while True:
-            raw = await websocket.receive_text()
-            try:
-                packet = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning(f"Session {session_id}: invalid JSON packet received")
-                continue
+            packet = await websocket.receive_json()
+            manager.ingest_packet(packet)
 
-            # Ingest into segment buffer
-            await manager.ingest(packet)
-
-            # Process any completed segments
-            while manager.segment_ready():
-                segment = manager.pop_segment()
-                try:
-                    result = await pipeline.process_segment(segment)
-                    await websocket.send_json({
-                        "type":    "SEGMENT_COMPLETE",
-                        "segment": _serialise_result(result),
-                    })
-                except Exception as exc:
-                    logger.error(f"Segment processing error: {exc}", exc_info=True)
-                    await websocket.send_json({
-                        "type":       "SEGMENT_ERROR",
-                        "segment_id": segment.get("segment_id"),
-                        "error":      str(exc),
-                    })
+            for segment in manager.get_ready_segments():
+                logger.info(f"[{session_id}] Processing segment: {segment['segment_id']}")
+                asyncio.create_task(process_and_notify(websocket, pipeline, segment))
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket session closed: {session_id}")
-
-    except Exception as exc:
-        logger.error(f"WebSocket session {session_id} error: {exc}", exc_info=True)
+        logger.info(f"Client disconnected for session: {session_id}")
+        manager.flush()
+        for segment in manager.get_ready_segments():
+            asyncio.create_task(process_and_notify(websocket, pipeline, segment))
 
     finally:
-        # Finalise any remaining buffered data
-        last_seg = manager.finalise_session()
-        if last_seg:
-            try:
-                result = await pipeline.process_segment(last_seg)
-                _active_pipelines.pop(session_id, None)
-                _active_managers.pop(session_id, None)
-                pipeline.finalise()
-                logger.info(f"Session {session_id} finalised. "
-                            f"Segments: {manager.total_segments}")
-            except Exception:
-                pass
+        pipeline.finalise()
+        active_sessions.pop(session_id, None)
 
 
-# ── REST Endpoints ─────────────────────────────────────────────────────────
-
-@app.get("/session/{session_id}/summary", tags=["Sessions"])
-async def get_session_summary(session_id: str):
-    """Return aggregate statistics for a completed or active session."""
-    pipeline = _active_pipelines.get(session_id)
-    if not pipeline:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
-    return pipeline.get_session_summary()
-
-
-@app.get("/report/{session_id}", tags=["Reports"])
-async def generate_report(session_id: str):
-    """
-    Generate and return a PDF report for a completed session.
-    """
-    pipeline = _active_pipelines.get(session_id)
-    if not pipeline:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
-
-    summary = pipeline.get_session_summary()
-    if summary.get("segments_processed", 0) == 0:
-        raise HTTPException(status_code=400, detail="No segments processed in this session yet.")
-
+async def process_and_notify(websocket: WebSocket, pipeline: PULSEPipeline, segment: dict):
+    """Run the ML pipeline and stream results back to the frontend."""
     try:
-        from backend.output.report_generator import generate_pdf_report
-        pdf_path = generate_pdf_report(summary, output_dir="output/reports")
-        return FileResponse(
-            pdf_path,
-            media_type="application/pdf",
-            filename=f"PULSE_report_{session_id}.pdf",
-        )
-    except Exception as exc:
-        logger.error(f"Report generation failed: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Report generation failed: {exc}")
+        result = await pipeline.process_segment(segment)
+        if websocket.client_state.name == "CONNECTED":
+            await websocket.send_json({"type": "segment_result", "data": result})
+    except Exception as e:
+        logger.error(f"Pipeline error on segment {segment.get('segment_id')}: {e}")
+        if websocket.client_state.name == "CONNECTED":
+            await websocket.send_json({"type": "error", "message": str(e)})
 
 
-@app.get("/sessions", tags=["Sessions"])
-async def list_sessions():
-    """List all currently active sessions."""
-    return {
-        "active_sessions": [
-            {
-                "session_id": sid,
-                "segments":   p.get_session_summary().get("segments_processed", 0),
+@app.get("/session/{session_id}/summary")
+def get_session_summary(session_id: str):
+    """Fetch aggregate data for an entire drive."""
+    if session_id in active_sessions:
+        return active_sessions[session_id]["pipeline"].get_session_summary()
+    return {"error": "Session not found or already closed."}
+
+
+# ── Debug Endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/debug/sessions")
+def list_debug_sessions():
+    """List all debug sessions that have been recorded."""
+    if not DEBUG_DIR.exists():
+        return {"sessions": []}
+    sessions = []
+    for d in sorted(DEBUG_DIR.iterdir()):
+        if d.is_dir():
+            segments = [s.name for s in sorted(d.iterdir()) if s.is_dir()]
+            sessions.append({"session_id": d.name, "segments": segments})
+    return {"sessions": sessions}
+
+
+@app.get("/debug/{session_id}/{segment_id}")
+def get_debug_data(session_id: str, segment_id: str):
+    """Return all debug JSON files for a specific segment."""
+    seg_dir = DEBUG_DIR / session_id / segment_id
+    if not seg_dir.exists():
+        return {"error": "Segment not found"}
+
+    result = {"session_id": session_id, "segment_id": segment_id, "files": {}}
+
+    for f in sorted(seg_dir.iterdir()):
+        if f.suffix == ".json":
+            try:
+                result["files"][f.name] = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                result["files"][f.name] = {"error": "Could not parse"}
+        elif f.suffix == ".txt":
+            result["files"][f.name] = f.read_text(encoding="utf-8")
+        elif f.is_dir():
+            images = [img.name for img in sorted(f.iterdir()) if img.suffix in (".jpg", ".png")]
+            result["files"][f.name] = {
+                "type": "image_directory",
+                "count": len(images),
+                "files": images,
+                "base_url": f"/debug-files/{session_id}/{segment_id}/{f.name}"
             }
-            for sid, p in _active_pipelines.items()
-        ]
-    }
+
+    return result
 
 
-# ── Utilities ──────────────────────────────────────────────────────────────
-
-def _serialise_result(result: dict) -> dict:
-    """
-    Convert result dict to JSON-serializable form.
-    Removes numpy arrays and Open3D objects — keep only scalars/lists/strings.
-    """
-    import numpy as np
-
-    clean = {}
-    for k, v in result.items():
-        if isinstance(v, np.ndarray):
-            clean[k] = v.tolist()
-        elif isinstance(v, (np.integer, np.floating)):
-            clean[k] = v.item()
-        elif k in ("point_cloud",):
-            # Open3D point cloud — skip for WebSocket (too large)
-            clean[k] = None
-        elif isinstance(v, dict):
-            clean[k] = _serialise_result(v)
-        elif isinstance(v, list):
-            clean[k] = [
-                _serialise_result(i) if isinstance(i, dict) else i
-                for i in v
-            ]
-        else:
-            clean[k] = v
-    return clean
+@app.get("/debug/viewer", response_class=HTMLResponse)
+def debug_viewer():
+    """Serve the debug viewer from frontend/debug.html."""
+    html_path = FRONTEND_DIR / "debug.html"
+    if html_path.exists():
+        return html_path.read_text(encoding="utf-8")
+    return "<h1>Debug viewer not found</h1><p>Expected at frontend/debug.html</p>"

@@ -49,7 +49,7 @@ scikit-learn==1.5.2
 joblib==1.4.2
 
 # ── LLM / Ollama ──────────────────────────────────────────────────
-ollama==0.3.3
+# Ollama models accessed via HTTP API (no Python client needed)
 
 # ── PDF Generation ────────────────────────────────────────────────
 reportlab==4.2.5
@@ -61,8 +61,6 @@ requests==2.32.3
 # ── Utilities ─────────────────────────────────────────────────────
 python-dotenv==1.0.1
 pydantic==2.10.3
-pydantic-settings==2.6.1
-loguru==0.7.2                 # Structured logging
 tqdm==4.67.1                  # Progress bars
 
 # ── Testing ───────────────────────────────────────────────────────

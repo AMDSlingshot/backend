@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PULSE Collector</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #111;
+            color: #fff;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        h1 {
+            color: #64ffda;
+            text-align: center;
+        }
+
+        .card {
+            background: #222;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 10px 0;
+            width: 100%;
+            max-width: 400px;
+            box-sizing: border-box;
+        }
+
+        button {
+            background: #64ffda;
+            color: #000;
+            border: none;
+            padding: 15px 20px;
+            font-size: 18px;
+            border-radius: 8px;
+            width: 100%;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+
+        button:disabled {
+            background: #444;
+            color: #888;
+        }
+
+        button.stop {
+            background: #ff5252;
+            color: #fff;
+        }
+
+        video {
+            width: 100%;
+            border-radius: 8px;
+            background: #000;
+            min-height: 200px;
+            object-fit: cover;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            border-bottom: 1px solid #333;
+            padding-bottom: 5px;
+        }
+
+        .val {
+            font-family: monospace;
+            color: #64ffda;
+        }
+
+        #status {
+            text-align: center;
+            font-weight: bold;
+            padding: 10px;
+            border-radius: 8px;
+            background: #333;
+            margin-top: 10px;
+        }
+
+        .connected {
+            background: #1b5e20 !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>PULSE Collector</h1>
+
+    <div id="status">Disconnected</div>
+
+    <div class="card">
+        <video id="video-preview" autoplay playsinline muted></video>
+        <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+
+    <div class="card">
+        <div class="metric"><span>Speed (GPS)</span><span class="val" id="gps-speed">0 km/h</span></div>
+        <div class="metric"><span>Accel Z (IMU)</span><span class="val" id="imu-z">0.00</span></div>
+        <div class="metric"><span>Packets Sent</span><span class="val" id="pkt-count">0</span></div>
+    </div>
+
+    <button id="btn-start" onclick="startCollection()">Start Collection</button>
+    <button id="btn-stop" onclick="stopCollection()" class="stop" style="display:none;">Stop</button>
+
+    <script>
+        let ws;
+        let stream;
+        let gpsWatchId;
+        let isCollecting = false;
+        let packetCount = 0;
+        let session_id = "session_" + Date.now();
+
+        const video = document.getElementById('video-preview');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+
+        async function startCollection() {
+            try {
+                // Request camera
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
+                });
+                video.srcObject = stream;
+
+                // Request IMU permissions (iOS requires user gesture)
+                if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                    const permission = await DeviceMotionEvent.requestPermission();
+                    if (permission !== 'granted') {
+                        alert('IMU permission denied');
+                        return;
+                    }
+                }
+
+                // Connect WebSocket
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                // Connect to the backend route
+                ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${session_id}`);
+
+                ws.onopen = () => {
+                    document.getElementById('status').innerText = "Connected & Recording";
+                    document.getElementById('status').classList.add('connected');
+                    isCollecting = true;
+                    document.getElementById('btn-start').style.display = 'none';
+                    document.getElementById('btn-stop').style.display = 'block';
+
+                    startSensors();
+                };
+
+                ws.onclose = () => stopCollection();
+
+                ws.onmessage = (e) => {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === "segment_result") {
+                        alert(`Road Segment Analyzed!\nIRI: ${msg.data.iri?.iri_value?.toFixed(2) || 'N/A'}\nCondition: ${msg.data.final_condition}`);
+                    }
+                };
+
+            } catch (err) {
+                alert("Error starting sensors: " + err.message);
+            }
+        }
+
+        function stopCollection() {
+            isCollecting = false;
+            if (ws) ws.close();
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            if (gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
+            window.removeEventListener('devicemotion', handleMotion);
+
+            document.getElementById('status').innerText = "Disconnected";
+            document.getElementById('status').classList.remove('connected');
+            document.getElementById('btn-start').style.display = 'block';
+            document.getElementById('btn-stop').style.display = 'none';
+        }
+
+        function startSensors() {
+            // 1. IMU (200Hz ideal, browser yields ~60Hz)
+            window.addEventListener('devicemotion', handleMotion, true);
+
+            // 2. GPS (1Hz)
+            if (navigator.geolocation) {
+                gpsWatchId = navigator.geolocation.watchPosition((pos) => {
+                    const speed = pos.coords.speed || 0; // m/s
+                    document.getElementById('gps-speed').innerText = (speed * 3.6).toFixed(1) + " km/h";
+                    sendPacket("gps", {
+                        lat: pos.coords.latitude,
+                        lng: pos.coords.longitude,
+                        speed: speed,
+                        accuracy: pos.coords.accuracy,
+                        timestamp: pos.timestamp
+                    });
+                }, (err) => { }, { enableHighAccuracy: true });
+            }
+
+            // 3. Camera Frame (1Hz to save bandwidth)
+            setInterval(() => {
+                if (isCollecting && ws.readyState === WebSocket.OPEN) {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    // Compress to JPEG
+                    const b64 = canvas.toDataURL('image/jpeg', 0.5);
+                    sendPacket("camera", { image: b64 });
+                }
+            }, 1000);
+
+            // 4. Audio - Send dummy packet for now to stop crashing acoustic
+            setInterval(() => {
+                if (isCollecting) sendPacket("audio", { samples: new Array(4410).fill(0).map(() => Math.random() * 0.1) });
+            }, 100);
+        }
+
+        function handleMotion(e) {
+            if (!isCollecting || ws.readyState !== WebSocket.OPEN) return;
+            // Get linear acceleration (gravity removed if device supports it)
+            const az = e.acceleration ? e.acceleration.z : (e.accelerationIncludingGravity ? e.accelerationIncludingGravity.z - 9.81 : 0);
+            document.getElementById('imu-z').innerText = (az || 0).toFixed(2);
+
+            sendPacket("imu", {
+                ax: e.acceleration?.x || 0,
+                ay: e.acceleration?.y || 0,
+                az: az || 0,
+                timestamp: Date.now()
+            });
+        }
+
+        function sendPacket(type, data) {
+            if (isCollecting && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type, data }));
+                packetCount++;
+                if (packetCount % 10 === 0) {
+                    document.getElementById('pkt-count').innerText = packetCount;
+                }
+            }
+        }
+    </script>
+</body>
+
+</html>

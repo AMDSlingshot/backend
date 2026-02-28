@@ -38,26 +38,9 @@ VLM_OLLAMA_MODELS = [
     "qwen3-vl:2b",
 ]
 
-SYSTEM_PROMPT = """You are an expert pavement engineer certified in IRC:SP:20 \
-(Indian Rural Roads Manual) and IS:1237 standards. \
-You assess road surface condition from photographic evidence and output \
-structured JSON assessments only.
+SYSTEM_PROMPT = """You are a pavement engineer. Assess road surface condition from images. Output only valid JSON."""
 
-You identify and classify:
-- Cracking: alligator/fatigue, longitudinal, transverse, edge cracking
-- Surface defects: potholes (count + estimated diameter), raveling, bleeding
-- Deformation: rutting, corrugation, shoving
-- Drainage: inadequate camber, edge drop-off, blocked side drains
-- Surface type: BC (Bituminous Concrete), WBM (Water Bound Macadam), \
-  Granular (gravel), Rigid (concrete)
-
-Always output ONLY valid JSON. Never add commentary outside the JSON structure. \
-Base your assessment strictly on what is visible. Flag uncertainty explicitly."""
-
-ASSESSMENT_PROMPT = """Analyse these road surface images and produce a structured \
-distress assessment per IRC:SP:20 distress catalogue.
-
-Return ONLY this exact JSON structure (no markdown fences, no extra text):
+ASSESSMENT_PROMPT = """Analyse this road surface image. Return ONLY this JSON structure:
 {
     "surface_type": "BC|WBM|Granular|Rigid|Unknown",
     "overall_condition": "Good|Fair|Poor|Very Poor",
@@ -135,7 +118,7 @@ class VisualRoadAssessor:
         self,
         frames: list,           # List of PIL Images from the segment
         segment_id: str,
-        max_frames: int = 5,
+        max_frames: int = 3,
     ) -> dict:
         """
         Assess a road segment from a list of PIL frames.
@@ -168,39 +151,57 @@ class VisualRoadAssessor:
             # Encode frames as base64 JPEG
             images_b64 = [_frame_to_base64(f) for f in selected]
 
-            # Build Ollama multimodal request
+            # Build Ollama /api/chat multimodal request
+            # Qwen3-VL requires the chat endpoint with messages array
+            messages = [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": ASSESSMENT_PROMPT,
+                    "images": images_b64,
+                },
+            ]
+
             payload = {
                 "model":  model,
-                "system": SYSTEM_PROMPT,
-                "prompt": ASSESSMENT_PROMPT,
-                "images": images_b64,
+                "messages": messages,
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 512,
+                    # Qwen3-VL is a "thinking" model — it spends ~500 tokens on
+                    # internal <think> reasoning before producing the JSON answer.
+                    # num_predict must be large enough for thinking + response.
+                    "num_predict": 4096,
                 },
             }
 
             t0 = time.monotonic()
             resp = requests.post(
-                f"{self.host}/api/generate",
+                f"{self.host}/api/chat",
                 json=payload,
                 timeout=120,   # VLM inference can take 5–30s on 4b
             )
             elapsed = time.monotonic() - t0
 
             if resp.status_code != 200:
-                logger.error(f"Ollama VLM request failed: HTTP {resp.status_code}")
+                logger.error(f"Ollama VLM request failed: HTTP {resp.status_code} — {resp.text[:200]}")
                 return self._error_response(segment_id, f"ollama_http_{resp.status_code}")
 
-            raw_text = resp.json().get("response", "")
-            logger.debug(f"VLM inference: {elapsed:.1f}s, model={model}, segment={segment_id}")
+            resp_json = resp.json()
+
+            # Extract content — /api/chat returns {message: {content: ...}}
+            raw_text = resp_json.get("message", {}).get("content", "")
+            logger.info(f"VLM inference: {elapsed:.1f}s, model={model}, segment={segment_id}, response_len={len(raw_text)}")
 
             assessment = self._parse_response(raw_text)
             assessment["segment_id"]       = segment_id
             assessment["frames_analysed"]  = len(selected)
             assessment["model_used"]        = model
             assessment["inference_time_s"] = round(elapsed, 1)
+            assessment["raw_response"]     = raw_text
             return assessment
 
         except requests.Timeout:
