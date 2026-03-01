@@ -38,26 +38,61 @@ VLM_OLLAMA_MODELS = [
     "qwen3-vl:2b",
 ]
 
-SYSTEM_PROMPT = """You are a pavement engineer. Assess road surface condition from images. Output only valid JSON."""
+SYSTEM_PROMPT = """You are a pavement engineer. Assess road surface condition from images and provided sensor telemetry. Output only valid JSON."""
 
-ASSESSMENT_PROMPT = """Analyse this road surface image. Return ONLY this JSON structure:
-{
+ASSESSMENT_PROMPT_TEMPLATE = """
+You are assessing a 100m road segment. The survey vehicle captured the following sensor data:
+
+{sensor_context}
+
+Analyse the road surface images together with the sensor data above.
+Return ONLY this JSON structure:
+{{
     "surface_type": "BC|WBM|Granular|Rigid|Unknown",
     "overall_condition": "Good|Fair|Poor|Very Poor",
     "pci_estimate": <0-100>,
     "distresses": [
-        {
+        {{
             "type": "pothole|alligator_crack|longitudinal_crack|transverse_crack|raveling|bleeding|rutting|edge_drop|corrugation|drainage",
             "severity": "Low|Medium|High",
             "extent_percent": <0-100>,
             "notes": "<specific observation>"
-        }
+        }}
     ],
     "drainage_adequacy": "Adequate|Inadequate|Blocked",
     "recommended_intervention": "Routine|Preventive|Rehabilitation|Reconstruction",
     "confidence": "High|Medium|Low",
     "limiting_factor": "<what reduced confidence, or empty string if High>"
-}"""
+}}"""
+
+
+def _build_sensor_context(sensor_telemetry: dict) -> str:
+    """Format sensor telemetry dict into a human-readable text block for the VLM."""
+    if not sensor_telemetry:
+        return "No additional sensor data available."
+
+    lines = []
+    if "avg_speed_kmh" in sensor_telemetry:
+        lines.append(f"- Vehicle speed: {sensor_telemetry['avg_speed_kmh']} km/h")
+    if "accel_z_mean" in sensor_telemetry:
+        lines.append(f"- Vertical acceleration (az): mean={sensor_telemetry['accel_z_mean']} m/s², std={sensor_telemetry.get('accel_z_std', 'N/A')} m/s²")
+    if "gyro_x_mean" in sensor_telemetry:
+        lines.append(
+            f"- Gyroscope: X={sensor_telemetry['gyro_x_mean']} rad/s, "
+            f"Y={sensor_telemetry.get('gyro_y_mean', 0)} rad/s, "
+            f"Z={sensor_telemetry.get('gyro_z_mean', 0)} rad/s"
+        )
+    if "audio_rms_mean" in sensor_telemetry:
+        lines.append(
+            f"- Road noise (audio RMS): mean={sensor_telemetry['audio_rms_mean']}, "
+            f"peak={sensor_telemetry.get('audio_rms_max', 'N/A')}"
+        )
+    if "avg_heading_deg" in sensor_telemetry:
+        lines.append(f"- GPS heading: {sensor_telemetry['avg_heading_deg']}°")
+    if "avg_altitude_m" in sensor_telemetry:
+        lines.append(f"- Altitude: {sensor_telemetry['avg_altitude_m']} m ASL")
+
+    return "\n".join(lines) if lines else "No additional sensor data available."
 
 
 def _frame_to_base64(frame_pil) -> str:
@@ -116,17 +151,20 @@ class VisualRoadAssessor:
 
     def assess_segment(
         self,
-        frames: list,           # List of PIL Images from the segment
+        frames: list,              # List of PIL Images from the segment
         segment_id: str,
         max_frames: int = 3,
+        sensor_telemetry: dict | None = None,
     ) -> dict:
         """
         Assess a road segment from a list of PIL frames.
 
         Args:
-            frames:     PIL Images (typically 5–10 from a 100m segment).
-            segment_id: GPS-based identifier.
-            max_frames: Max frames to send to VLM (keep low for speed).
+            frames:           PIL Images (typically 5–10 from a 100m segment).
+            segment_id:       GPS-based identifier.
+            max_frames:       Max frames to send to VLM (keep low for speed).
+            sensor_telemetry: Optional dict with aggregated IMU/GPS/Audio data
+                              to inject into the prompt for multi-modal reasoning.
 
         Returns:
             Structured assessment dict.
@@ -151,6 +189,10 @@ class VisualRoadAssessor:
             # Encode frames as base64 JPEG
             images_b64 = [_frame_to_base64(f) for f in selected]
 
+            # Build the dynamic assessment prompt with sensor context
+            sensor_context = _build_sensor_context(sensor_telemetry or {})
+            assessment_prompt = ASSESSMENT_PROMPT_TEMPLATE.format(sensor_context=sensor_context)
+
             # Build Ollama /api/chat multimodal request
             # Qwen3-VL requires the chat endpoint with messages array
             messages = [
@@ -160,7 +202,7 @@ class VisualRoadAssessor:
                 },
                 {
                     "role": "user",
-                    "content": ASSESSMENT_PROMPT,
+                    "content": assessment_prompt,
                     "images": images_b64,
                 },
             ]

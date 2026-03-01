@@ -368,24 +368,43 @@ class PULSEPipeline:
     def _run_acoustic(self, segment: dict) -> dict:
         """Classify road surface from audio buffer."""
         audio_buf = segment.get("audio_buffer", [])
-        if not audio_buf or not self._acoustic_clf.is_ready:
+        if not audio_buf:
             return {"surface_type_acoustic": "Unknown", "confidence": 0.0}
 
         try:
-            # Reconstruct audio from RMS packets (rough — full WAV preferred)
-            # If raw samples were sent, use those
             all_samples = []
+            rms_values = []
             for pkt in audio_buf:
-                samples = pkt.get("samples", [])
-                if samples:
-                    all_samples.extend(samples)
+                # New format: {rms, dbfs, sample_rate} from Web Audio API
+                if "rms" in pkt:
+                    rms_values.append(pkt["rms"])
+                # Legacy format: {samples: [...]}
+                elif "samples" in pkt:
+                    all_samples.extend(pkt["samples"])
+
+            # If we have real RMS values, synthesise a representative waveform
+            if rms_values and not all_samples:
+                avg_rms = float(np.mean(rms_values))
+                # Synthesize a constant-amplitude signal at mean RMS for classifier
+                n_samples = 4096
+                all_samples = (np.random.randn(n_samples) * avg_rms).tolist()
 
             if not all_samples:
                 return {"surface_type_acoustic": "Unknown", "confidence": 0.0,
-                        "note": "No raw audio samples received — send full audio for classification"}
+                        "note": "No audio data received"}
+
+            if not self._acoustic_clf.is_ready:
+                avg_rms = float(np.mean(rms_values)) if rms_values else 0.0
+                return {"surface_type_acoustic": "Unknown", "confidence": 0.0,
+                        "avg_rms": round(avg_rms, 4),
+                        "note": "Acoustic model not loaded"}
 
             audio = np.array(all_samples, dtype=np.float32)
-            return self._acoustic_clf.classify(audio)
+            result = self._acoustic_clf.classify(audio)
+            if rms_values:
+                result["avg_rms"] = round(float(np.mean(rms_values)), 4)
+                result["avg_dbfs"] = round(20 * np.log10(max(float(np.mean(rms_values)), 1e-9)), 1)
+            return result
 
         except Exception as exc:
             logger.error(f"Acoustic classification failed: {exc}")
@@ -403,7 +422,7 @@ class PULSEPipeline:
             self._ensure_visual_assessor()
             from PIL import Image
             import cv2 as cv
-            from backend.agents.visual_assessor import SYSTEM_PROMPT, ASSESSMENT_PROMPT
+            from backend.agents.visual_assessor import SYSTEM_PROMPT
 
             # Convert frames to PIL (VLM input format)
             pil_frames = []
@@ -415,12 +434,45 @@ class PULSEPipeline:
             if not pil_frames:
                 return {"overall_condition": "Unknown", "confidence": "Low", "distresses": []}
 
+            # ── Aggregate sensor telemetry to enrich VLM prompt context ─────
+            imu_buf = segment.get("imu_buffer", [])
+            gps_buf = segment.get("gps_buffer", [])
+            audio_buf = segment.get("audio_buffer", [])
+
+            sensor_telemetry: dict = {}
+
+            if imu_buf:
+                az_vals = [p.get("az", 0.0) for p in imu_buf]
+                rx_vals = [p.get("rx", 0.0) for p in imu_buf]  # gyro X
+                ry_vals = [p.get("ry", 0.0) for p in imu_buf]  # gyro Y
+                rz_vals = [p.get("rz", 0.0) for p in imu_buf]  # gyro Z
+                sensor_telemetry["accel_z_mean"] = round(float(np.mean(az_vals)), 3)
+                sensor_telemetry["accel_z_std"] = round(float(np.std(az_vals)), 3)
+                sensor_telemetry["gyro_x_mean"] = round(float(np.mean(rx_vals)), 3)
+                sensor_telemetry["gyro_y_mean"] = round(float(np.mean(ry_vals)), 3)
+                sensor_telemetry["gyro_z_mean"] = round(float(np.mean(rz_vals)), 3)
+
+            if gps_buf:
+                speeds_ms = [g.get("speed", 0.0) for g in gps_buf]
+                headings = [g.get("heading", 0.0) for g in gps_buf]
+                altitudes = [g.get("altitude", 0.0) for g in gps_buf]
+                sensor_telemetry["avg_speed_kmh"] = round(float(np.mean(speeds_ms)) * 3.6, 1)
+                sensor_telemetry["avg_heading_deg"] = round(float(np.mean(headings)), 1)
+                sensor_telemetry["avg_altitude_m"] = round(float(np.mean(altitudes)), 1)
+
+            if audio_buf:
+                rms_list = [p.get("rms", 0.0) for p in audio_buf if "rms" in p]
+                if rms_list:
+                    sensor_telemetry["audio_rms_mean"] = round(float(np.mean(rms_list)), 4)
+                    sensor_telemetry["audio_rms_max"] = round(float(np.max(rms_list)), 4)
+
             # DEBUG: Log what we're about to send to VLM
-            self._debug.log_vlm_input(seg_id, pil_frames, ASSESSMENT_PROMPT, SYSTEM_PROMPT)
+            self._debug.log_vlm_input(seg_id, pil_frames, "[dynamic prompt with telemetry]", SYSTEM_PROMPT)
 
             result = self._visual_assessor.assess_segment(
                 frames=pil_frames,
                 segment_id=seg_id,
+                sensor_telemetry=sensor_telemetry,
             )
 
             # DEBUG: Log VLM raw response and parsed output

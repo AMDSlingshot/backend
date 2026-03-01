@@ -119,17 +119,41 @@
         let packetCount = 0;
         let session_id = "session_" + Date.now();
 
+        // New PWA-like sensor state variables
+        let audioCtx = null;
+        let analyser = null;
+        let micSource = null;
+        let totalDistanceM = 0;
+        let lastGps = null;
+
         const video = document.getElementById('video-preview');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d', { alpha: false });
 
+        // Helper: Haversine distance
+        function getDistanceMeters(lat1, lon1, lat2, lon2) {
+            const R = 6371e3; // metres
+            const φ1 = lat1 * Math.PI / 180;
+            const φ2 = lat2 * Math.PI / 180;
+            const Δφ = (lat2 - lat1) * Math.PI / 180;
+            const Δλ = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }
+
         async function startCollection() {
             try {
-                // Request camera
+                // Request camera AND audio
                 stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
+                    video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+                    audio: true
                 });
-                video.srcObject = stream;
+                // Attach video only (avoid feedback loop with audio)
+                const videoStream = new MediaStream(stream.getVideoTracks());
+                video.srcObject = videoStream;
 
                 // Request IMU permissions (iOS requires user gesture)
                 if (typeof DeviceMotionEvent.requestPermission === 'function') {
@@ -142,7 +166,6 @@
 
                 // Connect WebSocket
                 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                // Connect to the backend route
                 ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${session_id}`);
 
                 ws.onopen = () => {
@@ -151,6 +174,17 @@
                     isCollecting = true;
                     document.getElementById('btn-start').style.display = 'none';
                     document.getElementById('btn-stop').style.display = 'block';
+
+                    // Initialize Audio element for real RMS calculation
+                    try {
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        analyser = audioCtx.createAnalyser();
+                        analyser.fftSize = 256;
+                        micSource = audioCtx.createMediaStreamSource(stream);
+                        micSource.connect(analyser);
+                    } catch (err) {
+                        console.warn('AudioContext not supported or failed to start', err);
+                    }
 
                     startSensors();
                 };
@@ -171,10 +205,18 @@
 
         function stopCollection() {
             isCollecting = false;
+
+            if (audioCtx) {
+                audioCtx.close().catch(() => { });
+                audioCtx = null;
+            }
             if (ws) ws.close();
             if (stream) stream.getTracks().forEach(t => t.stop());
             if (gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
             window.removeEventListener('devicemotion', handleMotion);
+
+            totalDistanceM = 0;
+            lastGps = null;
 
             document.getElementById('status').innerText = "Disconnected";
             document.getElementById('status').classList.remove('connected');
@@ -191,37 +233,70 @@
                 gpsWatchId = navigator.geolocation.watchPosition((pos) => {
                     const speed = pos.coords.speed || 0; // m/s
                     document.getElementById('gps-speed').innerText = (speed * 3.6).toFixed(1) + " km/h";
+
+                    // Accumulate distance_m
+                    if (lastGps) {
+                        totalDistanceM += getDistanceMeters(lastGps.lat, lastGps.lng, pos.coords.latitude, pos.coords.longitude);
+                    }
+                    lastGps = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+
                     sendPacket("gps", {
                         lat: pos.coords.latitude,
                         lng: pos.coords.longitude,
                         speed: speed,
                         accuracy: pos.coords.accuracy,
+                        heading: pos.coords.heading || 0,
+                        altitude: pos.coords.altitude || 0,
+                        distance_m: totalDistanceM,
                         timestamp: pos.timestamp
                     });
                 }, (err) => { }, { enableHighAccuracy: true });
             }
 
-            // 3. Camera Frame (1Hz to save bandwidth)
+            // 3. Camera Frame (1Hz)
             setInterval(() => {
                 if (isCollecting && ws.readyState === WebSocket.OPEN) {
                     canvas.width = video.videoWidth;
                     canvas.height = video.videoHeight;
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    // Compress to JPEG
-                    const b64 = canvas.toDataURL('image/jpeg', 0.5);
-                    sendPacket("camera", { image: b64 });
+                    if (canvas.width > 0 && canvas.height > 0) {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        const b64 = canvas.toDataURL('image/jpeg', 0.5);
+                        sendPacket("camera", {
+                            image: b64,
+                            width: canvas.width,
+                            height: canvas.height,
+                            timestamp: Date.now()
+                        });
+                    }
                 }
             }, 1000);
 
-            // 4. Audio - Send dummy packet for now to stop crashing acoustic
+            // 4. Audio (Real RMS) ~10Hz
             setInterval(() => {
-                if (isCollecting) sendPacket("audio", { samples: new Array(4410).fill(0).map(() => Math.random() * 0.1) });
+                if (isCollecting && analyser) {
+                    const dataArray = new Float32Array(analyser.fftSize);
+                    analyser.getFloatTimeDomainData(dataArray);
+
+                    let sumSquares = 0.0;
+                    for (let i = 0; i < dataArray.length; i++) {
+                        sumSquares += dataArray[i] * dataArray[i];
+                    }
+                    const rms = Math.sqrt(sumSquares / dataArray.length);
+                    const dbfs = 20 * Math.log10(rms || 1e-6);
+
+                    // Note timestamp is inside data dict, per backend expectations
+                    sendPacket("audio", {
+                        rms: rms,
+                        dbfs: dbfs,
+                        sample_rate: audioCtx?.sampleRate || 44100,
+                        timestamp: Date.now()
+                    });
+                }
             }, 100);
         }
 
         function handleMotion(e) {
             if (!isCollecting || ws.readyState !== WebSocket.OPEN) return;
-            // Get linear acceleration (gravity removed if device supports it)
             const az = e.acceleration ? e.acceleration.z : (e.accelerationIncludingGravity ? e.accelerationIncludingGravity.z - 9.81 : 0);
             document.getElementById('imu-z').innerText = (az || 0).toFixed(2);
 
@@ -229,12 +304,16 @@
                 ax: e.acceleration?.x || 0,
                 ay: e.acceleration?.y || 0,
                 az: az || 0,
+                rx: e.rotationRate?.alpha || 0, // In browser: alpha = Z
+                ry: e.rotationRate?.beta || 0,  // beta = X
+                rz: e.rotationRate?.gamma || 0, // gamma = Y
                 timestamp: Date.now()
             });
         }
 
         function sendPacket(type, data) {
             if (isCollecting && ws && ws.readyState === WebSocket.OPEN) {
+                // Structure fully matching backend expectations: {"type": "imu", "data": {...}}
                 ws.send(JSON.stringify({ type, data }));
                 packetCount++;
                 if (packetCount % 10 === 0) {

@@ -5,6 +5,7 @@ FastAPI entrypoint for PULSE.
 Provides:
 - WebSocket endpoint for real-time smartphone data ingestion
 - REST endpoints for session summaries and report generation
+- REST API endpoints for Next.js dashboard (live, sessions, stats, segments)
 - Debug endpoints for inspecting pipeline data
 """
 
@@ -14,7 +15,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 # Load .env from project root BEFORE anything reads os.getenv()
 try:
@@ -69,11 +70,53 @@ app.add_middleware(
 if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
-if DEBUG_DIR.exists():
-    app.mount("/debug-files", StaticFiles(directory=str(DEBUG_DIR)), name="debug-files")
+# Ensure debug dir exists before mounting so the route doesn't fail silently on startup
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/debug-files", StaticFiles(directory=str(DEBUG_DIR)), name="debug-files")
 
 # Active session states
 active_sessions: Dict[str, dict] = {}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _load_all_session_results() -> List[dict]:
+    """
+    Read pipeline_result.json files from every debug session/segment directory.
+    Returns a flat list of all segment result dicts.
+    """
+    results = []
+    if not DEBUG_DIR.exists():
+        return results
+    for session_dir in sorted(DEBUG_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        for seg_dir in sorted(session_dir.iterdir()):
+            if not seg_dir.is_dir():
+                continue
+            result_file = seg_dir / "pipeline_result.json"
+            if result_file.exists():
+                try:
+                    results.append(json.loads(result_file.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+    return results
+
+
+def _session_summary_from_segments(session_id: str, segs: List[dict]) -> dict:
+    """Build a SessionSummary dict from a list of segment result dicts."""
+    iri_values = [s["iri"]["iri_value"] for s in segs
+                  if s.get("iri", {}).get("iri_value") is not None]
+    pci_values = [s.get("pci_estimate") for s in segs if s.get("pci_estimate") is not None]
+    total_km = sum(s.get("length_km", 0) for s in segs)
+    return {
+        "session_id": session_id,
+        "status": "completed",
+        "segment_count": len(segs),
+        "avg_iri": round(sum(iri_values) / len(iri_values), 2) if iri_values else None,
+        "avg_pci": round(sum(pci_values) / len(pci_values), 1) if pci_values else None,
+        "total_distance_km": round(total_km, 4),
+    }
 
 
 # ── Core Endpoints ───────────────────────────────────────────────────────────
@@ -95,12 +138,25 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     active_sessions[session_id] = {
         "manager": manager,
         "pipeline": pipeline,
+        "current_gps": None,
+        "current_speed_kmh": 0.0,
     }
 
     try:
         while True:
             packet = await websocket.receive_json()
             manager.ingest_packet(packet)
+
+            # Update live telemetry for /api/live endpoint
+            ptype = packet.get("type", "")
+            pdata = packet.get("data", {})
+            if ptype == "gps":
+                active_sessions[session_id]["current_gps"] = {
+                    "lat": pdata.get("lat", 0),
+                    "lng": pdata.get("lng", 0),
+                }
+                speed_ms = pdata.get("speed", 0)
+                active_sessions[session_id]["current_speed_kmh"] = round(speed_ms * 3.6, 1)
 
             for segment in manager.get_ready_segments():
                 logger.info(f"[{session_id}] Processing segment: {segment['segment_id']}")
@@ -129,9 +185,167 @@ async def process_and_notify(websocket: WebSocket, pipeline: PULSEPipeline, segm
             await websocket.send_json({"type": "error", "message": str(e)})
 
 
+# ── Dashboard REST API ────────────────────────────────────────────────────────
+
+@app.get("/api/live")
+def get_live_status():
+    """
+    Return currently active WebSocket sessions with live telemetry.
+    Consumed by Next.js dashboard Zustand store every 5 seconds.
+    """
+    live_sessions = []
+    for sid, state in active_sessions.items():
+        summary = state["pipeline"].get_session_summary()
+        live_sessions.append({
+            "session_id": sid,
+            "status": "active",
+            "current_gps": state.get("current_gps"),
+            "current_speed_kmh": state.get("current_speed_kmh", 0.0),
+            "current_iri": summary.get("avg_iri"),
+            "current_pci": None,  # Not computed live — available post-segment
+            "segment_count": summary.get("segments_processed", 0),
+        })
+    return {
+        "active": len(live_sessions) > 0,
+        "sessions": live_sessions,
+    }
+
+
+@app.get("/api/sessions")
+def list_sessions():
+    """
+    Return list of all historical sessions (from debug output files) plus any active sessions.
+    """
+    all_segments = _load_all_session_results()
+
+    # Group by session_id
+    session_map: Dict[str, List[dict]] = {}
+    for seg in all_segments:
+        sid = seg.get("session_id", "unknown")
+        session_map.setdefault(sid, []).append(seg)
+
+    sessions = [
+        _session_summary_from_segments(sid, segs)
+        for sid, segs in sorted(session_map.items())
+    ]
+
+    # Also include currently active sessions not yet in files
+    active_ids = set(active_sessions.keys())
+    file_ids = {s["session_id"] for s in sessions}
+    for sid in active_ids - file_ids:
+        summary = active_sessions[sid]["pipeline"].get_session_summary()
+        sessions.append({
+            "session_id": sid,
+            "status": "active",
+            "segment_count": summary.get("segments_processed", 0),
+            "avg_iri": summary.get("avg_iri"),
+            "avg_pci": None,
+            "total_distance_km": summary.get("total_length_km", 0),
+        })
+
+    return {"sessions": sessions}
+
+
+@app.get("/api/stats")
+def get_global_stats():
+    """
+    Return aggregate statistics across all historical sessions.
+    """
+    all_segments = _load_all_session_results()
+
+    # Count unique sessions from files
+    session_ids = {s.get("session_id") for s in all_segments}
+
+    iri_values = [s["iri"]["iri_value"] for s in all_segments
+                  if s.get("iri", {}).get("iri_value") is not None]
+    pci_values = [s.get("pci_estimate") for s in all_segments
+                  if s.get("pci_estimate") is not None]
+    total_km = sum(s.get("length_km", 0) for s in all_segments)
+    distress_count = sum(len(s.get("distresses", [])) for s in all_segments)
+
+    return {
+        "total_sessions": len(session_ids) + len(active_sessions),
+        "total_segments": len(all_segments),
+        "total_distance_km": round(total_km, 4),
+        "avg_iri": round(sum(iri_values) / len(iri_values), 2) if iri_values else None,
+        "avg_pci": round(sum(pci_values) / len(pci_values), 1) if pci_values else None,
+        "distress_count": distress_count,
+    }
+
+
+@app.get("/api/sessions/{session_id}/segments")
+def get_session_segments(session_id: str):
+    """
+    Return all segment results for a specific session.
+    First checks in-memory (active), then on-disk debug files.
+    """
+    # Check active sessions first (in-memory)
+    if session_id in active_sessions:
+        summary = active_sessions[session_id]["pipeline"].get_session_summary()
+        segs = summary.get("segments", [])
+        return {"session_id": session_id, "status": "active", "segments": segs}
+
+    # Load from debug output files
+    session_dir = DEBUG_DIR / session_id
+    if not session_dir.exists():
+        return {"error": f"Session {session_id} not found", "segments": []}
+
+    segs = []
+    for seg_dir in sorted(session_dir.iterdir()):
+        if not seg_dir.is_dir():
+            continue
+        result_file = seg_dir / "pipeline_result.json"
+        if result_file.exists():
+            try:
+                segs.append(json.loads(result_file.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+
+    return {"session_id": session_id, "status": "completed", "segments": segs}
+
+
+@app.get("/api/frames/{session_id}")
+def get_session_frames(session_id: str):
+    """
+    Return frame lists for each segment in a session.
+    Used by the Visual Feed (context) page to display VLM input images.
+    Images are served via the /debug-files/* static mount.
+    """
+    session_dir = DEBUG_DIR / session_id
+    if not session_dir.exists():
+        return {"session_id": session_id, "segments": []}
+
+    segment_frames = []
+    for seg_dir in sorted(session_dir.iterdir()):
+        if not seg_dir.is_dir():
+            continue
+        seg_id = seg_dir.name
+
+        # vlm_input_frames first (frames actually sent to VLM), fallback to captured_frames
+        for frame_dir_name in ("vlm_input_frames", "captured_frames"):
+            frame_dir = seg_dir / frame_dir_name
+            if frame_dir.exists():
+                frames = sorted(
+                    f.name for f in frame_dir.iterdir()
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png")
+                )
+                if frames:
+                    base_url = f"/debug-files/{session_id}/{seg_id}/{frame_dir_name}"
+                    segment_frames.append({
+                        "segment_id": seg_id,
+                        "frame_source": frame_dir_name,
+                        "frames": frames,
+                        "count": len(frames),
+                        "base_url": base_url,
+                    })
+                    break
+
+    return {"session_id": session_id, "segments": segment_frames}
+
+
 @app.get("/session/{session_id}/summary")
 def get_session_summary(session_id: str):
-    """Fetch aggregate data for an entire drive."""
+    """Fetch aggregate data for an entire drive (legacy endpoint)."""
     if session_id in active_sessions:
         return active_sessions[session_id]["pipeline"].get_session_summary()
     return {"error": "Session not found or already closed."}
