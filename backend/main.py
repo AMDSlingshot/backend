@@ -29,7 +29,11 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import tempfile
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -142,6 +146,73 @@ async def process_and_notify(
         logger.error(f"Pipeline error on segment {segment.get('segment_id')}: {e}")
         if websocket.client_state.name == "CONNECTED":
             await websocket.send_json({"type": "ERROR", "message": str(e)})
+
+
+# ── HTTP Video Upload — PWA sends recorded video clips here ─────────────────
+
+
+@app.post("/upload/video/{session_id}")
+async def upload_video(session_id: str, video: UploadFile = File(...)):
+    """
+    Receive a short video clip from the PWA, extract frames using OpenCV,
+    and inject them into the active session's SegmentManager buffer.
+
+    This avoids takePictureAsync (shutter sound + preview freeze) on the phone.
+    The PWA records silent video via recordAsync() and uploads here.
+    """
+    if session_id not in active_sessions:
+        return {"error": "Session not found or already closed", "frames_extracted": 0}
+
+    manager = active_sessions[session_id]["manager"]
+
+    # Write the uploaded bytes to a temp file so OpenCV can read it
+    tmp = None
+    frames_extracted = 0
+    try:
+        contents = await video.read()
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp.write(contents)
+        tmp.flush()
+        tmp.close()
+
+        cap = cv2.VideoCapture(tmp.name)
+        if not cap.isOpened():
+            logger.warning(f"[Upload] Could not open video file for session {session_id}")
+            return {"error": "Could not decode video", "frames_extracted": 0}
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Sample ~2 frames per second (evenly spaced) to match the pipeline's needs
+        target_fps = 2.0
+        frame_interval = max(1, int(fps / target_fps))
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % frame_interval == 0:
+                manager._buffer["frames"].append(frame)
+                frames_extracted += 1
+            frame_idx += 1
+
+        cap.release()
+        logger.info(
+            f"[Upload] Session {session_id}: extracted {frames_extracted} frames "
+            f"from {frame_idx} total ({fps:.0f} fps video)"
+        )
+    except Exception as e:
+        logger.error(f"[Upload] Frame extraction failed for {session_id}: {e}")
+        return {"error": str(e), "frames_extracted": frames_extracted}
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    return {"ok": True, "frames_extracted": frames_extracted}
 
 
 # ── REST API — Dashboard ────────────────────────────────────────────────────

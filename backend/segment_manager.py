@@ -63,22 +63,33 @@ class SegmentManager:
     def ingest_packet(self, packet: dict):
         """
         Takes an incoming dictionary packet from the WebSocket.
-        Expected format: {"type": "gps"|"imu"|"camera"|"audio", "data": {...}}
+
+        Handles TWO formats:
+          PWA flat:   {"type": "GPS", "lat": ..., "lng": ...}
+          Canonical:  {"type": "gps", "data": {"lat": ..., "lng": ...}}
         """
-        p_type = packet.get("type")
-        data = packet.get("data", {})
+        p_type = (packet.get("type") or "").lower()
+
+        # Support both flat packets (PWA) and nested {type, data} packets.
+        # If the packet already contains a "data" key, use it; otherwise
+        # treat the entire packet (minus "type") as the data payload.
+        if "data" in packet and isinstance(packet["data"], dict):
+            data = packet["data"]
+        else:
+            data = {k: v for k, v in packet.items() if k != "type"}
 
         if p_type == "gps":
             self._handle_gps(data)
+
         elif p_type == "imu":
             self._buffer["imu_buffer"].append(data)
-        elif p_type == "camera":
-            # For efficiency in a real system, you'd decode Base64 to cv2 here.
-            # We assume it's pre-processed or we decode it later.
+
+        elif p_type in ("camera", "video_segment"):
             import cv2
             import numpy as np
             import base64
-            
+
+            # Accept base64 JPEG image sent from PWA (field: "image")
             b64_img = data.get("image", "")
             if b64_img:
                 try:
